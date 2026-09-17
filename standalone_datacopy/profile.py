@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import math
+import shutil
 import statistics
 import subprocess
 from pathlib import Path
@@ -53,6 +54,8 @@ def workflow_cycles(folder, mode):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
+    parser.add_argument('--msprof', default='msprof',
+                        help='msprof executable path; default: resolve msprof from PATH')
     parser.add_argument('--soc-version', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--rows', type=int, default=256)
@@ -83,6 +86,12 @@ def main():
         if config != saved:
             parser.error('Analysis arguments must match saved config.json')
     else:
+        msprof = shutil.which(args.msprof)
+        if msprof is None:
+            parser.error(f'msprof executable not found or not executable: {args.msprof}. '
+                         'Use --msprof /path/to/tools/profiler/bin/msprof')
+        msprof = str(Path(msprof).absolute())
+        print(f'Using msprof: {msprof}')
         binary = str(args.binary.resolve(strict=True))
         args.output.mkdir(parents=True, exist_ok=False)
         (args.output / 'config.json').write_text(json.dumps(config, indent=2) + '\n')
@@ -90,7 +99,7 @@ def main():
         def run(mode, store, directory):
             directory.mkdir()
             kib = args.small_kib if mode == 'small' else args.large_kib
-            command = ['msprof', 'op', 'simulator', f'--soc-version={args.soc_version}',
+            command = [msprof, 'op', 'simulator', f'--soc-version={args.soc_version}',
                        f'--output={directory.resolve() / "prof"}', binary, mode,
                        str(args.rows), str(args.cols), str(kib), str(store), str(args.device)]
             (directory / 'command.json').write_text(json.dumps(command, indent=2))

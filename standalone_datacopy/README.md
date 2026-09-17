@@ -64,9 +64,22 @@ cmake --build build -j8
 
 ## 一键校验并采集 cycles
 
+如果msprof不在PATH中，或PATH指向另一套安装，显式指定可执行文件：
+
+```bash
+export MSPROF_BIN="$ASCEND_HOME_PATH/tools/profiler/bin/msprof"
+test -x "$MSPROF_BIN"
+"$MSPROF_BIN" op simulator --help
+```
+
+请按实际安装位置修改该路径。脚本打印实际使用的msprof路径，并写入每次运行的command.json。
+不传 `--msprof` 时从PATH查找。指定路径只解决程序选择，不保证解决所有校验失败；
+如果仍缺少 `verification=PASS`，需要继续检查该次run.log。
+
 ```bash
 python3 profile.py \
   --binary build/demo_datacopy \
+  --msprof "$MSPROF_BIN" \
   --soc-version "$SOC_VERSION" \
   --rows 256 --cols 768 \
   --small-kib 8 --large-kib 240 \

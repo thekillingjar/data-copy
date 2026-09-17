@@ -69,10 +69,15 @@ class TilingTest(unittest.TestCase):
             root = Path(tmp)
             binary = root / 'demo'
             binary.touch()
+            msprof = root / 'tools' / 'profiler' / 'bin' / 'msprof'
+            msprof.parent.mkdir(parents=True)
+            msprof.write_text('#!/bin/sh\nexit 0\n')
+            msprof.chmod(0o755)
             out = root / 'results'
             calls = []
 
             def fake_run(command, stdout, **kwargs):
+                self.assertEqual(command[0], str(msprof))
                 mode = command[6]
                 store = int(command[10])
                 calls.append((mode, store))
@@ -85,7 +90,7 @@ class TilingTest(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0)
 
             argv = ['profile.py', '--binary', str(binary), '--soc-version', 'test',
-                    '--output', str(out), '--trials', '1']
+                    '--output', str(out), '--trials', '1', '--msprof', str(msprof)]
             with patch.object(sys, 'argv', argv), patch.object(profiler.subprocess, 'run', fake_run), patch('builtins.print'):
                 profiler.main()
             self.assertEqual(calls, [(m, s) for s in [1, 0] for m in ['small', 'large', 'pretranspose']])
