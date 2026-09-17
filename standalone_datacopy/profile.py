@@ -5,27 +5,80 @@ import csv
 import json
 import math
 import shutil
+import shlex
+import re
 import statistics
 import subprocess
 from pathlib import Path
 
 
-def read_cycles(folder, kernel):
-    values = []
-    for path in folder.rglob('op_summary*.csv'):
+def numeric(value):
+    try:
+        number = float(str(value).strip().rstrip('%'))
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def pipe_ratio(row, pipe):
+    # Same precedence and bare-number convention as HW_GE_ATT NDDMA.
+    zero = None
+    for field in [f'aiv_{pipe}_ratio', f'{pipe}_exe_ratio', f'aic_{pipe}_ratio']:
+        raw = row.get(field, '')
+        value = numeric(raw)
+        if value is None:
+            continue
+        ratio = value / 100 if '%' in str(raw) or value > 1 else value
+        if not 0 <= ratio <= 1:
+            raise ValueError(f'Invalid {field}: {raw}')
+        if ratio > 0:
+            return ratio, field
+        zero = (ratio, field)
+    for numerator, denominator in [(f'aiv_{pipe}_time(us)', 'aiv_time(us)'),
+                                   (f'{pipe}_exe_time(us)', 'aiv_time(us)'),
+                                   (f'{pipe}_exe_time(us)', 'Task Duration(us)')]:
+        n, d = numeric(row.get(numerator)), numeric(row.get(denominator))
+        if n is not None and d is not None and d > 0 and 0 < n <= d:
+            return n / d, f'{numerator}/{denominator}'
+    if zero is not None:
+        return zero
+    raise ValueError(f'Missing {pipe} ratio/time fields; cannot derive {pipe} cycles')
+
+
+def read_metrics(folder, kernel):
+    matches = []
+    for path in sorted(folder.rglob('op_summary*.csv')):
         with path.open(encoding='utf-8-sig', newline='') as stream:
-            for row in csv.DictReader(stream):
-                if not any(kernel in value for value in row.values() if value):
+            for line, row in enumerate(csv.DictReader(stream), 2):
+                row = {key.strip(): value for key, value in row.items() if key is not None}
+                name = row.get('Op Name', '')
+                if not re.search(r'(?<![A-Za-z0-9_])' + re.escape(kernel) + r'(?![A-Za-z0-9_])', name):
                     continue
-                value = row.get('aiv_total_cycles', '').strip()
-                if value and value not in ('N/A', 'NA', '--'):
-                    number = float(value)
-                    if math.isfinite(number) and number > 0:
-                        values.append(number)
-    if len(values) != 1:
-        raise RuntimeError(f'{folder}: expected exactly one {kernel} aiv_total_cycles row, got {len(values)}. '
-                           'Inspect op_summary schema; no time-to-cycle conversion is performed.')
-    return values[0]
+                total = numeric(row.get('aiv_total_cycles'))
+                if total is None or total <= 0:
+                    raise ValueError(f'{path}:{line}: missing positive aiv_total_cycles')
+                block_dim = numeric(row.get('Block Dim', row.get('BlockDim')))
+                if block_dim is not None and block_dim != 1:
+                    raise ValueError(f'{path}:{line}: expected single-core Block Dim=1')
+                ratio, field = pipe_ratio(row, 'mte2')
+                result = dict(kernel=kernel, source_file=str(path), source_row=line,
+                              aiv_total_cycles=total, mte2_ratio=ratio,
+                              mte2_ratio_field=field, mte2_cycles=total * ratio)
+                try:
+                    r3, f3 = pipe_ratio(row, 'mte3')
+                    result.update(mte3_ratio=r3, mte3_ratio_field=f3, mte3_cycles=total * r3)
+                except ValueError:
+                    result.update(mte3_ratio=None, mte3_ratio_field='', mte3_cycles=None)
+                matches.append(result)
+    if len(matches) != 1:
+        raise RuntimeError(f'{folder}: expected exactly one {kernel} row, got {len(matches)}. '
+                           'Inspect op_summary names and exported schema.')
+    return matches[0]
+
+
+def build_command(msprof, folder, application):
+    # Matches HW_GE_ATT/NDDMA/.../round2/scripts/run_round2_collection.py.
+    return [msprof, f'--output={folder}', f'--application={shlex.join(application)}']
 
 
 def tile_plan(rows, cols, kib):
@@ -42,21 +95,24 @@ def tile_plan(rows, cols, kib):
                 tile_count=(cols + tile_cols - 1) // tile_cols)
 
 
-def workflow_cycles(folder, mode):
-    if mode == 'pretranspose':
-        pre = read_cycles(folder, 'datacopy_pretranspose')
-        load = read_cycles(folder, 'datacopy_contiguous')
-        return pre, load, pre + load
-    load = read_cycles(folder, 'datacopy_' + mode)
-    return 0, load, load
+def workflow_metrics(folder, mode):
+    kernels = ['datacopy_pretranspose', 'datacopy_contiguous'] if mode == 'pretranspose' else ['datacopy_' + mode]
+    stages = [read_metrics(folder, kernel) for kernel in kernels]
+    pre = stages[0]['mte2_cycles'] if mode == 'pretranspose' else 0
+    load = stages[-1]['mte2_cycles']
+    mte3 = [stage['mte3_cycles'] for stage in stages]
+    return dict(pretranspose_mte2_cycles=pre, load_mte2_cycles=load,
+                mte2_cycles=pre + load,
+                aiv_total_cycles=sum(stage['aiv_total_cycles'] for stage in stages),
+                mte3_cycles=sum(mte3) if all(v is not None for v in mte3) else None), stages
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
-    parser.add_argument('--msprof', default='msprof',
+    parser.add_argument('--msprof', '--msprof-bin', dest='msprof', default='msprof',
                         help='msprof executable path; default: resolve msprof from PATH')
-    parser.add_argument('--soc-version', required=True)
+    parser.add_argument('--soc-version', default='', help='Optional metadata only; device profiling does not require it')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--rows', type=int, default=256)
     parser.add_argument('--cols', type=int, default=768)
@@ -76,7 +132,7 @@ def main():
     if small['tile_bytes'] >= large['tile_bytes']:
         parser.error('Actual small tile must be smaller than large tile')
     modes = ['small', 'large', 'pretranspose']
-    config = dict(rows=args.rows, cols=args.cols, small_kib=args.small_kib,
+    config = dict(profiling_mode='application', metric='mte2_cycles', rows=args.rows, cols=args.cols, small_kib=args.small_kib,
                   large_kib=args.large_kib, trials=args.trials, device=args.device,
                   soc_version=args.soc_version, binary=str(args.binary.resolve()),
                   input_bytes=args.rows * args.cols * 4, hardware_ub_bytes=256 * 1024,
@@ -99,14 +155,18 @@ def main():
         def run(mode, store, directory):
             directory.mkdir()
             kib = args.small_kib if mode == 'small' else args.large_kib
-            command = [msprof, 'op', 'simulator', f'--soc-version={args.soc_version}',
-                       f'--output={directory.resolve() / "prof"}', binary, mode,
-                       str(args.rows), str(args.cols), str(kib), str(store), str(args.device)]
+            report = directory.resolve() / 'verification.txt'
+            application = [binary, mode, str(args.rows), str(args.cols), str(kib),
+                           str(store), str(args.device)]
+            if store:
+                application.append(str(report))
+            command = build_command(msprof, directory.resolve() / 'prof', application)
             (directory / 'command.json').write_text(json.dumps(command, indent=2))
             with (directory / 'run.log').open('w') as log:
                 subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
-            if store and 'verification=PASS' not in (directory / 'run.log').read_text():
-                raise RuntimeError(f'Correctness check did not pass: {directory}')
+            if store and (not report.exists() or report.read_text().strip() != 'verification=PASS'):
+                raise RuntimeError(f'No successful application verification report: {report}. '
+                                   f'Check {directory / "run.log"}; rebuild demo_datacopy with the updated source.')
 
         # Validation stores every tile and compares every output element.
         # These three invocations are excluded from timed results.
@@ -117,29 +177,36 @@ def main():
             for mode in modes[trial % 3:] + modes[:trial % 3]:
                 run(mode, 0, args.output / f'{mode}_trial{trial}')
 
-    records = []
+    records, stage_records = [], []
     for trial in range(args.trials):
         for mode in modes:
-            pre, load, total = workflow_cycles(args.output / f'{mode}_trial{trial}', mode)
+            metrics, stages = workflow_metrics(args.output / f'{mode}_trial{trial}', mode)
+            stage_records.extend(dict(mode=mode, trial=trial, **stage) for stage in stages)
             plan = small if mode == 'small' else large
             records.append(dict(mode=mode, trial=trial, rows=args.rows, cols=args.cols,
-                                **plan, pretranspose_cycles=pre, load_cycles=load,
-                                total_cycles=total))
+                                **plan, **metrics))
     with (args.output / 'raw.csv').open('w', newline='') as stream:
         writer = csv.DictWriter(stream, fieldnames=list(records[0]))
         writer.writeheader()
         writer.writerows(records)
+    with (args.output / 'stages.csv').open('w', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(stage_records[0]))
+        writer.writeheader()
+        writer.writerows(stage_records)
     summary = {}
     for mode in modes:
         selected = [row for row in records if row['mode'] == mode]
         summary[mode] = {key: statistics.median(row[key] for row in selected)
-                         for key in ['pretranspose_cycles', 'load_cycles', 'total_cycles']}
-        summary[mode]['min_total_cycles'] = min(row['total_cycles'] for row in selected)
-        summary[mode]['max_total_cycles'] = max(row['total_cycles'] for row in selected)
-    result = dict(metric='sum of single-core aiv_total_cycles per full workflow; excludes host/inter-kernel gaps',
+                         for key in ['pretranspose_mte2_cycles', 'load_mte2_cycles', 'mte2_cycles', 'aiv_total_cycles']}
+        summary[mode]['mte3_cycles'] = (statistics.median(row['mte3_cycles'] for row in selected)
+                                         if all(row['mte3_cycles'] is not None for row in selected) else None)
+        summary[mode]['min_mte2_cycles'] = min(row['mte2_cycles'] for row in selected)
+        summary[mode]['max_mte2_cycles'] = max(row['mte2_cycles'] for row in selected)
+    denominator = summary['large']['mte2_cycles']
+    result = dict(metric='mte2_cycles = aiv_total_cycles * normalized MTE2 ratio (HW_GE_ATT NDDMA convention)',
                   results=summary,
-                  small_over_large=summary['small']['total_cycles'] / summary['large']['total_cycles'],
-                  pretranspose_over_large=summary['pretranspose']['total_cycles'] / summary['large']['total_cycles'])
+                  small_over_large_mte2=(summary['small']['mte2_cycles'] / denominator if denominator else None),
+                  pretranspose_over_large_mte2=(summary['pretranspose']['mte2_cycles'] / denominator if denominator else None))
     (args.output / 'summary.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result, indent=2))
 

@@ -1,5 +1,6 @@
 """Host model checks; not a substitute for Ascend compilation/simulation."""
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -54,20 +55,36 @@ class TilingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
             path = folder / 'op_summary_test.csv'
-            path.write_text('Op Name,aiv_total_cycles\ndatacopy_pretranspose,120\ndatacopy_contiguous,30\n')
-            self.assertEqual(profiler.workflow_cycles(folder, 'pretranspose'), (120, 30, 150))
-            path.write_text('Op Name,Task Duration(us)\ndatacopy_small,1.2\n')
+            path.write_text('Op Name,aiv_total_cycles,aiv_mte2_ratio,aiv_mte3_ratio\n'
+                            'datacopy_pretranspose,120,50,25\ndatacopy_contiguous,30,0.8,0\n')
+            metrics, stages = profiler.workflow_metrics(folder, 'pretranspose')
+            self.assertEqual(metrics['mte2_cycles'], 84)
+            self.assertEqual(metrics['mte3_cycles'], 30)
+            self.assertEqual(metrics['aiv_total_cycles'], 150)
+            self.assertEqual(stages[0]['mte2_ratio_field'], 'aiv_mte2_ratio')
+            path.write_text('Op Name,aiv_total_cycles\ndatacopy_small,100\n')
+            with self.assertRaises(ValueError):
+                profiler.read_metrics(folder, 'datacopy_small')
+            path.write_text('Op Name,aiv_total_cycles,aiv_mte2_ratio\n'
+                            'datacopy_small,10,0.5\ndatacopy_small,20,0.5\n')
             with self.assertRaises(RuntimeError):
-                profiler.read_cycles(folder, 'datacopy_small')
-            path.write_text('Op Name,aiv_total_cycles\ndatacopy_small,10\ndatacopy_small,20\n')
-            with self.assertRaises(RuntimeError):
-                profiler.read_cycles(folder, 'datacopy_small')
+                profiler.read_metrics(folder, 'datacopy_small')
+
+    def test_ratio_conventions(self):
+        for value, expected in [('50', 0.5), ('0.5', 0.5), ('0.5%', 0.005), ('0', 0)]:
+            self.assertEqual(profiler.pipe_ratio({'aiv_mte2_ratio': value}, 'mte2')[0], expected)
+        ratio, field = profiler.pipe_ratio({'aiv_mte2_ratio': 'N/A',
+                                            'aiv_mte2_time(us)': '2', 'aiv_time(us)': '8'}, 'mte2')
+        self.assertEqual(ratio, 0.25)
+        self.assertIn('/', field)
+        with self.assertRaises(ValueError):
+            profiler.pipe_ratio({'aiv_mte2_ratio': '-1'}, 'mte2')
 
     def test_collection_flow_with_synthetic_profiler(self):
         # Synthetic values are fixtures, never measured performance.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            binary = root / 'demo'
+            binary = root / 'demo with spaces'
             binary.touch()
             msprof = root / 'tools' / 'profiler' / 'bin' / 'msprof'
             msprof.parent.mkdir(parents=True)
@@ -78,15 +95,21 @@ class TilingTest(unittest.TestCase):
 
             def fake_run(command, stdout, **kwargs):
                 self.assertEqual(command[0], str(msprof))
-                mode = command[6]
-                store = int(command[10])
+                self.assertEqual(len(command), 3)
+                application = shlex.split(command[2].split('=', 1)[1])
+                self.assertEqual(application[0], str(binary.resolve()))
+                mode = application[1]
+                store = int(application[5])
                 calls.append((mode, store))
-                prof = Path(command[4].split('=', 1)[1])
+                prof = Path(command[1].split('=', 1)[1])
                 prof.mkdir(parents=True)
-                rows = ('datacopy_pretranspose,120\ndatacopy_contiguous,30\n'
-                        if mode == 'pretranspose' else f'datacopy_{mode},100\n')
-                (prof / 'op_summary.csv').write_text('Op Name,aiv_total_cycles\n' + rows)
-                stdout.write('verification=PASS\n' if store else 'verification=not_requested\n')
+                rows = ('datacopy_pretranspose,120,0.5\ndatacopy_contiguous,30,0.8\n'
+                        if mode == 'pretranspose' else f'datacopy_{mode},100,0.5\n')
+                (prof / 'op_summary.csv').write_text('Op Name,aiv_total_cycles,aiv_mte2_ratio\n' + rows)
+                # Application stdout is deliberately absent from profiler log.
+                stdout.write('Profiling finished\n')
+                if store:
+                    Path(application[7]).write_text('verification=PASS\n')
                 return subprocess.CompletedProcess(command, 0)
 
             argv = ['profile.py', '--binary', str(binary), '--soc-version', 'test',
@@ -95,8 +118,19 @@ class TilingTest(unittest.TestCase):
                 profiler.main()
             self.assertEqual(calls, [(m, s) for s in [1, 0] for m in ['small', 'large', 'pretranspose']])
             result = json.loads((out / 'summary.json').read_text())
-            self.assertEqual(result['results']['pretranspose']['total_cycles'], 150)
-            self.assertEqual(result['pretranspose_over_large'], 1.5)
+            self.assertEqual(result['results']['pretranspose']['mte2_cycles'], 84)
+            self.assertEqual(result['pretranspose_over_large_mte2'], 1.68)
+
+            # A profiler exit code of zero (or a PASS string in its stdout)
+            # must not bypass a missing application-owned verification file.
+            missing_out = root / 'missing_report'
+            argv[argv.index(str(out))] = str(missing_out)
+            def no_report(command, stdout, **kwargs):
+                stdout.write('verification=PASS\n')
+                return subprocess.CompletedProcess(command, 0)
+            with patch.object(sys, 'argv', argv), patch.object(profiler.subprocess, 'run', no_report), patch('builtins.print'):
+                with self.assertRaisesRegex(RuntimeError, 'verification report'):
+                    profiler.main()
 
 
 if __name__ == '__main__':
