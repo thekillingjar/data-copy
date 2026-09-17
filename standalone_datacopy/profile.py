@@ -61,7 +61,11 @@ def read_metrics(folder, kernel):
                 if block_dim is not None and block_dim != 1:
                     raise ValueError(f'{path}:{line}: expected single-core Block Dim=1')
                 ratio, field = pipe_ratio(row, 'mte2')
+                duration = numeric(row.get('Task Duration(us)'))
+                if duration is not None and duration < 0:
+                    raise ValueError(f'{path}:{line}: negative Task Duration(us)')
                 result = dict(kernel=kernel, source_file=str(path), source_row=line,
+                              task_duration_us=duration,
                               aiv_total_cycles=total, mte2_ratio=ratio,
                               mte2_ratio_field=field, mte2_cycles=total * ratio)
                 try:
@@ -101,7 +105,11 @@ def workflow_metrics(folder, mode):
     pre = stages[0]['mte2_cycles'] if mode == 'pretranspose' else 0
     load = stages[-1]['mte2_cycles']
     mte3 = [stage['mte3_cycles'] for stage in stages]
+    durations = [stage['task_duration_us'] for stage in stages]
     return dict(pretranspose_mte2_cycles=pre, load_mte2_cycles=load,
+                pretranspose_duration_us=durations[0] if mode == 'pretranspose' else 0,
+                load_duration_us=durations[-1],
+                task_duration_us=sum(durations) if all(v is not None for v in durations) else None,
                 mte2_cycles=pre + load,
                 aiv_total_cycles=sum(stage['aiv_total_cycles'] for stage in stages),
                 mte3_cycles=sum(mte3) if all(v is not None for v in mte3) else None), stages
@@ -202,11 +210,22 @@ def main():
                                          if all(row['mte3_cycles'] is not None for row in selected) else None)
         summary[mode]['min_mte2_cycles'] = min(row['mte2_cycles'] for row in selected)
         summary[mode]['max_mte2_cycles'] = max(row['mte2_cycles'] for row in selected)
+        for key in ['pretranspose_duration_us', 'load_duration_us', 'task_duration_us']:
+            values = [row[key] for row in selected]
+            summary[mode][key] = statistics.median(values) if all(v is not None for v in values) else None
+        durations = [row['task_duration_us'] for row in selected]
+        summary[mode]['min_task_duration_us'] = min(durations) if all(v is not None for v in durations) else None
+        summary[mode]['max_task_duration_us'] = max(durations) if all(v is not None for v in durations) else None
     denominator = summary['large']['mte2_cycles']
     result = dict(metric='mte2_cycles = aiv_total_cycles * normalized MTE2 ratio (HW_GE_ATT NDDMA convention)',
                   results=summary,
                   small_over_large_mte2=(summary['small']['mte2_cycles'] / denominator if denominator else None),
                   pretranspose_over_large_mte2=(summary['pretranspose']['mte2_cycles'] / denominator if denominator else None))
+    duration_base = summary['large']['task_duration_us']
+    result['duration_metric'] = 'sum of Task Duration(us) per workflow; excludes inter-kernel gaps and host overhead'
+    for mode in ['small', 'pretranspose']:
+        duration = summary[mode]['task_duration_us']
+        result[f'{mode}_over_large_duration'] = duration / duration_base if duration is not None and duration_base else None
     (args.output / 'summary.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result, indent=2))
 

@@ -61,6 +61,7 @@ class TilingTest(unittest.TestCase):
             self.assertEqual(metrics['mte2_cycles'], 84)
             self.assertEqual(metrics['mte3_cycles'], 30)
             self.assertEqual(metrics['aiv_total_cycles'], 150)
+            self.assertIsNone(metrics['task_duration_us'])
             self.assertEqual(stages[0]['mte2_ratio_field'], 'aiv_mte2_ratio')
             path.write_text('Op Name,aiv_total_cycles\ndatacopy_small,100\n')
             with self.assertRaises(ValueError):
@@ -103,9 +104,9 @@ class TilingTest(unittest.TestCase):
                 calls.append((mode, store))
                 prof = Path(command[1].split('=', 1)[1])
                 prof.mkdir(parents=True)
-                rows = ('datacopy_pretranspose,120,0.5\ndatacopy_contiguous,30,0.8\n'
-                        if mode == 'pretranspose' else f'datacopy_{mode},100,0.5\n')
-                (prof / 'op_summary.csv').write_text('Op Name,aiv_total_cycles,aiv_mte2_ratio\n' + rows)
+                rows = ('datacopy_pretranspose,120,0.5,12\ndatacopy_contiguous,30,0.8,3\n'
+                        if mode == 'pretranspose' else f'datacopy_{mode},100,0.5,10\n')
+                (prof / 'op_summary.csv').write_text('Op Name,aiv_total_cycles,aiv_mte2_ratio,Task Duration(us)\n' + rows)
                 # Application stdout is deliberately absent from profiler log.
                 stdout.write('Profiling finished\n')
                 if store:
@@ -120,6 +121,11 @@ class TilingTest(unittest.TestCase):
             result = json.loads((out / 'summary.json').read_text())
             self.assertEqual(result['results']['pretranspose']['mte2_cycles'], 84)
             self.assertEqual(result['pretranspose_over_large_mte2'], 1.68)
+            self.assertEqual(result['results']['pretranspose']['task_duration_us'], 15)
+            self.assertEqual(result['results']['pretranspose']['pretranspose_duration_us'], 12)
+            self.assertEqual(result['results']['pretranspose']['load_duration_us'], 3)
+            self.assertEqual(result['pretranspose_over_large_duration'], 1.5)
+            self.assertEqual(result['small_over_large_duration'], 1)
 
             # A profiler exit code of zero (or a PASS string in its stdout)
             # must not bypass a missing application-owned verification file.

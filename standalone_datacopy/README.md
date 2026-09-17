@@ -118,6 +118,28 @@ python3 profile.py \
 
 ## 指标口径
 
+### 设备执行耗时对比：Task Duration(us)
+
+`summary.json` 的 `results.<方案>.task_duration_us` 为各trial完整方案耗时的中位数：
+
+```text
+small / large：对应kernel的 Task Duration(us)
+pretranspose：预转置kernel的 Task Duration(us) + 连续搬入kernel的 Task Duration(us)
+```
+
+同时输出 `pretranspose_duration_us`、`load_duration_us`、min/max，
+以及 `small_over_large_duration`、`pretranspose_over_large_duration`；比值大于1表示分子方案更慢。
+先对每个trial两个阶段求和，再跨trial取中位数。
+此指标不包含两个kernel之间的间隙和主机开销，不称为主机端到端延迟。
+`stages.csv`保留各kernel原始耗时，`raw.csv`保留各trial汇总值。
+缺少/无效的Task Duration字段显示null（CSV为空），不会用aiv_time或cycles替代；
+某方案任一trial缺失时，该方案耗时汇总也为null，MTE2统计仍保留。
+
+已有采集结果不需要重新跑设备：用原采集命令的相同参数追加 `--analyze-only` 即可。
+本次仅修改Python解析，无需重新编译kernel。
+
+### MTE2 cycles
+
 ```text
 单kernel mte2_cycles = aiv_total_cycles × normalized_mte2_ratio
 ```
